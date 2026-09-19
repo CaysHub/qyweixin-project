@@ -31,9 +31,16 @@ test("真实 HTTP：认证、配置、回调验证、重复消息排重、分页
         ENCRYPTION_KEY: randomBytes(32).toString("hex"),
         DATA_DIR: dir,
       },
-      stdio: "ignore",
+      stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  let output = "";
+  child.stdout.on("data", (chunk) => {
+    output += chunk;
+  });
+  child.stderr.on("data", (chunk) => {
+    output += chunk;
+  });
   t.after(async () => {
     child.kill("SIGTERM");
     await new Promise((r) => child.once("exit", r));
@@ -73,7 +80,6 @@ test("真实 HTTP：认证、配置、回调验证、重复消息排重、分页
   const created = await req("/api/bots/save", {
     name: "测试机器人",
     mode: "url",
-    botId: "test-bot",
     ...f.credentials,
   });
   assert.equal(created.status, 200);
@@ -82,10 +88,31 @@ test("真实 HTTP：认证、配置、回调验证、重复消息排重、分页
   assert.equal(
     (
       await req("/api/bots/save", {
-        name: "重复",
-        mode: "url",
-        botId: "test-bot",
-        ...f.credentials,
+        name: "长连接缺少标识",
+        mode: "websocket",
+        secret: "test-secret",
+      })
+    ).status,
+    400,
+  );
+  assert.equal(
+    (
+      await req("/api/bots/save", {
+        name: "长连接",
+        mode: "websocket",
+        botId: "ws-test",
+        secret: "test-secret",
+      })
+    ).status,
+    200,
+  );
+  assert.equal(
+    (
+      await req("/api/bots/save", {
+        name: "重复长连接",
+        mode: "websocket",
+        botId: "ws-test",
+        secret: "test-secret",
       })
     ).status,
     409,
@@ -101,11 +128,15 @@ test("真实 HTTP：认证、配置、回调验证、重复消息排重、分页
   });
   const verified = await fetch(origin + "/callbacks/wecom?" + verify);
   assert.equal(await verified.text(), "verification");
-  assert.equal((await req("/api/bots")).body.rows[0].status, "verified");
+  assert.equal(
+    (await req("/api/bots")).body.rows.find((b) => b.id === id).status,
+    "verified",
+  );
   const message = {
     msgid: "message-1",
     aibotid: "test-bot",
     msgtype: "text",
+    chattype: "single",
     text: { content: "你好，测试" },
     from: { userid: "alice" },
     response_url:
@@ -127,9 +158,94 @@ test("真实 HTTP：认证、配置、回调验证、重复消息排重、分页
   }
   const messages = await req("/api/messages");
   assert.equal(messages.body.total, 1);
+  assert.equal(messages.body.rows[0].chat_type, "single");
   assert.equal(messages.body.rows[0].content, "你好，测试");
   assert.equal(messages.body.rows[0].response_url, undefined);
   assert.equal((await req("/api/messages?search=不存在")).body.total, 0);
+  assert.equal((await fetch(origin + "/callbacks/wecom")).status, 404);
+  const invalidBody = await fetch(origin + "/callbacks/wecom?bot=" + id, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: '{"secret":"PRIVATE-BODY",',
+  });
+  assert.equal(invalidBody.status, 400);
+  assert.ok(invalidBody.headers.get("x-request-id"));
+  assert.equal(
+    (
+      await fetch(origin + "/callbacks/wecom?bot=" + id, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: '{"encrypt":"invalid"}',
+      })
+    ).status,
+    400,
+  );
+  for (const plain of [
+    '{"msgtype":"event"}',
+    '{"private":"PRIVATE-PLAINTEXT",',
+  ]) {
+    const invalid = fixture(
+      plain,
+      f.credentials.token,
+      Buffer.from(f.credentials.aesKey + "=", "base64"),
+    );
+    const result = await fetch(
+      origin +
+        "/callbacks/wecom?" +
+        new URLSearchParams({ bot: id, ...invalid.query }),
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ encrypt: invalid.encrypted }),
+      },
+    );
+    assert.equal(result.status, plain.endsWith("}") ? 200 : 400);
+  }
+  await delay(50);
+  const entries = output
+    .split("\n")
+    .filter((line) => line.startsWith("{"))
+    .map((line) => JSON.parse(line));
+  for (const event of [
+    "callback.received",
+    "callback.finished",
+    "callback.decrypted",
+    "message.stored",
+    "message.duplicate",
+    "message.skipped",
+    "callback.failed",
+  ])
+    assert.ok(
+      entries.some((entry) => entry.event === event),
+      event,
+    );
+  assert.ok(entries.some((entry) => entry.reason === "missing_bot_parameter"));
+  assert.ok(entries.some((entry) => entry.stage === "http_body"));
+  assert.ok(entries.some((entry) => entry.stage === "parse_message"));
+  const stored = entries.find((entry) => entry.event === "message.stored");
+  assert.ok(
+    entries.some(
+      (entry) =>
+        entry.event === "callback.finished" &&
+        entry.requestId === stored.requestId &&
+        entry.status === 200,
+    ),
+  );
+  for (const secret of [
+    pass,
+    f.credentials.token,
+    f.credentials.aesKey,
+    enc.encrypted,
+    message.text.content,
+    "private-code",
+    "PRIVATE-BODY",
+    "PRIVATE-PLAINTEXT",
+  ])
+    assert.equal(
+      output.includes(secret),
+      false,
+      "logs must not contain secrets or message bodies",
+    );
   const blocked = await fetch(origin + "/api/bots/toggle", {
     method: "POST",
     headers: {

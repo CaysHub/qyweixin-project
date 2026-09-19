@@ -140,7 +140,7 @@ Compose 将端口只绑定到主机 `127.0.0.1:3100`，数据使用 `bridge-data
 
 ### URL 回调
 
-1. 企业微信后台选择智能机器人 API 模式 → 设置接收消息 URL。记录 BotID、Token、EncodingAESKey。
+1. 企业微信后台选择智能机器人 API 模式 → 设置接收消息 URL。记录 Token、EncodingAESKey。
 2. 企微桥 → 机器人管理 → 接入机器人 → URL 回调，填写凭证，保存并启用。
 3. 复制生成的地址，例如 `https://bot.example.com/callbacks/wecom?bot=内部UUID`。
 4. 将完整地址（含 `?bot=` 查询参数）填入企业微信，Token 和 EncodingAESKey 与网站保持一致。
@@ -203,3 +203,41 @@ node --env-file=.env scripts/backup.js /www/backup/wecom-bridge
 - https://developer.work.weixin.qq.com/document/path/101138
 - https://developer.work.weixin.qq.com/document/path/101463
 - https://developer.work.weixin.qq.com/document/path/101033
+
+## 回调诊断与本次覆盖部署
+
+诊断日志默认开启，输出到 Node 标准输出；PM2 部署使用 `pm2 logs wecom-bridge --lines 200` 查看。每次回调带独立 `requestId`，响应头也返回 `X-Request-ID`。日志包含阶段、状态码、耗时、内部机器人 ID、消息类型及正文长度，不打印 Token、AES 密钥、签名、密文、消息正文、用户 ID 或 response_url。异常仅输出已知错误原因和调用栈位置，不输出可能带敏感数据的原始错误消息。
+
+| 日志事件 | 含义 |
+| --- | --- |
+| `service.ready` | 当前版本已启动，包含已启用的 URL 机器人数量 |
+| `callback.received` | 请求已到应用，包含参数是否存在、是否为 JSON 请求 |
+| `callback.rejected` | 方法、内部 bot 参数、启用状态或模式不符合要求，查看 reason |
+| `callback.bot_matched` | 已找到对应的 URL 机器人 |
+| `callback.decrypt_started` / `callback.decrypted` | 开始校验解密 / 已成功解密 |
+| `callback.verified` | GET 地址验证成功，不代表已收到聊天消息 |
+| `message.received` | 已解析消息，包含 single/group 类型和关键字段是否存在 |
+| `message.skipped` | 缺少字符串类型 msgid，未入库 |
+| `message.stored` / `message.duplicate` | 已入库 / 重复投递未新增 |
+| `message.ai_queue` / `message.ai_skipped` | 自动回复入队结果 / 跳过原因 |
+| `callback.failed` | 失败阶段：http_body、credentials、decrypt、parse_message、receive_message 等 |
+| `callback.finished` / `callback.disconnected` | 最终状态码与耗时 / 连接提前断开 |
+
+URL 模式无需企业微信 BotID，已有 URL 机器人无需重建；此版本不再将回调中的 aibotid 与旧配置中手填的 BotID 比较，仍严格验证 Token 签名与 AES 加密。企业微信后台必须使用控制台生成的完整地址，包括 `?bot=内部记录ID`。
+
+部署包 `wecom-bridge-diagnostics.tar.gz` 含构建好的 dist 和源码，不含 `.env`、data、node_modules。上传到服务器 `/tmp`，先备份当前代码，再执行（假设项目路径与本文相同）：
+
+```bash
+cd /www/wwwroot/wecom-bridge
+pm2 stop wecom-bridge
+tar -czf "/tmp/wecom-bridge-code-before-$(date +%Y%m%d-%H%M%S).tar.gz" \
+  --exclude='./.env' --exclude='./.env.*' --exclude='./data' \
+  --exclude='./node_modules' --exclude='./.git' --exclude='./artifacts' .
+tar -xzf /tmp/wecom-bridge-diagnostics.tar.gz -C /www/wwwroot/wecom-bridge
+npm ci --omit=dev
+pm2 restart wecom-bridge
+curl -fsS http://127.0.0.1:3100/api/health
+pm2 logs wecom-bridge --lines 200
+```
+
+逐条执行，任一步失败先处理错误再继续。不要删除整个项目目录，不要重新初始化 `.env`；覆盖解压会保留服务器现有 `.env` 和 data。上述代码备份不含数据库和密钥，数据备份仍按前述在线备份流程执行。发送一条单聊文本，沿同一个 requestId 查看从 callback.received 到 message.stored 的日志；真实收发需要在部署环境验证。

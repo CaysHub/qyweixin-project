@@ -19,6 +19,7 @@ import {
 } from "./crypto.js";
 import { Connections } from "./connections.js";
 import { complete } from "./model.js";
+import { diagnostic, safeError } from "./diagnostics.js";
 
 const production = process.env.NODE_ENV === "production";
 const password = process.env.ADMIN_PASSWORD || "";
@@ -43,6 +44,34 @@ app.use(
     strictTransportSecurity: production ? undefined : false,
   }),
 );
+app.use((req, res, next) => {
+  if (req.path === "/callbacks/wecom") {
+    req.callbackId = randomUUID();
+    const started = Date.now();
+    res.set("X-Request-ID", req.callbackId);
+    diagnostic("callback.received", {
+      requestId: req.callbackId,
+      method: req.method,
+      hasBot: typeof req.query.bot === "string" && Boolean(req.query.bot),
+      hasSignature: typeof req.query.msg_signature === "string",
+      hasTimestamp: typeof req.query.timestamp === "string",
+      hasNonce: typeof req.query.nonce === "string",
+      jsonContentType: Boolean(req.is("application/json")),
+    });
+    res.on("finish", () =>
+      diagnostic("callback.finished", {
+        requestId: req.callbackId,
+        status: res.statusCode,
+        durationMs: Date.now() - started,
+      }),
+    );
+    res.on("close", () => {
+      if (!res.writableFinished)
+        diagnostic("callback.disconnected", { requestId: req.callbackId });
+    });
+  }
+  next();
+});
 app.use(express.json({ limit: "1mb" }));
 const log = (action, detail) => audit(db, action, detail);
 const credentials = (bot) => unseal(bot.credentials, key);
@@ -58,10 +87,46 @@ function modelConfig() {
   const row = db.prepare("SELECT value FROM settings WHERE id='model'").get();
   return row ? unseal(row.value, key) : defaultModel;
 }
-function receive(bot, body, reqId = "") {
-  if (!body || typeof body.msgid !== "string") return;
-  if (body.aibotid && body.aibotid !== bot.bot_id)
+function receive(bot, body, reqId = "", callbackId = "") {
+  const context = {
+    requestId: callbackId || randomUUID(),
+    botId: bot.id,
+    mode: bot.mode,
+  };
+  diagnostic("message.received", {
+    ...context,
+    hasMessageId: typeof body?.msgid === "string",
+    messageType: [
+      "text",
+      "voice",
+      "image",
+      "mixed",
+      "file",
+      "event",
+      "stream",
+    ].includes(body?.msgtype)
+      ? body.msgtype
+      : "unknown",
+    chatType: ["single", "group"].includes(body?.chattype)
+      ? body.chattype
+      : "unspecified",
+    hasAibotId: Boolean(body?.aibotid),
+    hasResponseUrl: Boolean(body?.response_url),
+    textLength:
+      typeof body?.text?.content === "string" ? body.text.content.length : 0,
+  });
+  if (!body || typeof body.msgid !== "string") {
+    diagnostic("message.skipped", { ...context, reason: "missing_message_id" });
+    return;
+  }
+  // URL callbacks are authenticated by this record's Token/AES key, not a user-entered BotID.
+  if (bot.mode === "websocket" && body.aibotid && body.aibotid !== bot.bot_id) {
+    diagnostic("message.rejected", {
+      ...context,
+      reason: "bot_identity_mismatch",
+    });
     throw new Error("机器人身份不匹配");
+  }
   const response =
     bot.mode === "url" && body.response_url
       ? validateResponseUrl(body.response_url)
@@ -77,38 +142,66 @@ function receive(bot, body, reqId = "") {
     (body.event
       ? `事件：${body.event.eventtype}`
       : `[${body.msgtype || "未知"} 消息]`);
-  db.prepare(
-    "INSERT OR IGNORE INTO messages (id,bot_id,external_id,req_id,kind,sender,chat_id,chat_type,content,response_url,expires_at,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
-  ).run(
-    randomUUID(),
-    bot.id,
-    body.msgid,
-    reqId,
-    body.msgtype || "unknown",
-    body.from?.userid || "",
-    body.chatid || body.from?.userid || "",
-    body.chattype || "single",
-    String(content).slice(0, 30000),
-    response ? seal(response, key) : null,
-    canReply
-      ? new Date(
-          Date.now() + (bot.mode === "url" ? 3600000 : 86400000),
-        ).toISOString()
-      : null,
-    canReply ? "pending" : "received",
-    now,
-  );
-  if (canReply && body.msgtype === "text" && modelConfig().enabled) {
+  const inserted = db
+    .prepare(
+      "INSERT OR IGNORE INTO messages (id,bot_id,external_id,req_id,kind,sender,chat_id,chat_type,content,response_url,expires_at,status,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)",
+    )
+    .run(
+      randomUUID(),
+      bot.id,
+      body.msgid,
+      reqId,
+      body.msgtype || "unknown",
+      body.from?.userid || "",
+      body.chatid || body.from?.userid || "",
+      body.chattype || "single",
+      String(content).slice(0, 30000),
+      response ? seal(response, key) : null,
+      canReply
+        ? new Date(
+            Date.now() + (bot.mode === "url" ? 3600000 : 86400000),
+          ).toISOString()
+        : null,
+      canReply ? "pending" : "received",
+      now,
+    );
+  diagnostic(inserted.changes ? "message.stored" : "message.duplicate", {
+    ...context,
+    canReply,
+    status: canReply ? "pending" : "received",
+  });
+  const aiEnabled =
+    canReply && body.msgtype === "text" && modelConfig().enabled;
+  if (aiEnabled) {
     const m = db
       .prepare(
         "SELECT id,status FROM messages WHERE bot_id=? AND external_id=?",
       )
       .get(bot.id, body.msgid);
-    if (m.status === "pending")
-      db.prepare("INSERT OR IGNORE INTO jobs VALUES (?,'queued',NULL,?)").run(
-        m.id,
-        now,
-      );
+    if (m.status === "pending") {
+      const queued = db
+        .prepare("INSERT OR IGNORE INTO jobs VALUES (?,'queued',NULL,?)")
+        .run(m.id, now);
+      diagnostic("message.ai_queue", {
+        ...context,
+        messageId: m.id,
+        queued: Boolean(queued.changes),
+      });
+    } else {
+      diagnostic("message.ai_skipped", {
+        ...context,
+        reason: "already_processed",
+      });
+    }
+  } else {
+    diagnostic("message.ai_skipped", {
+      ...context,
+      reason: !canReply
+        ? "no_reply_channel"
+        : body.msgtype !== "text"
+          ? "not_text"
+          : "model_disabled",
+    });
   }
 }
 const connections = new Connections({ receive, credentials, log });
@@ -232,11 +325,9 @@ app.post("/api/model/save", auth, (req, res) => {
     previous = modelConfig();
   const u = new URL(c.baseUrl);
   if (u.protocol !== "https:" || u.username || u.password || u.search || u.hash)
-    return res
-      .status(400)
-      .json({
-        error: "请填写 HTTPS 模型基础地址，例如 https://api.openai.com/v1",
-      });
+    return res.status(400).json({
+      error: "请填写 HTTPS 模型基础地址，例如 https://api.openai.com/v1",
+    });
   c.apiKey = c.apiKey || previous.apiKey;
   if (!c.apiKey) return res.status(400).json({ error: "请填写模型 API Key" });
   db.prepare(
@@ -282,7 +373,7 @@ const botSchema = z.object({
   id: z.string().uuid().optional(),
   name: z.string().trim().min(1).max(50),
   mode: z.enum(["url", "websocket"]),
-  botId: z.string().trim().min(1).max(200),
+  botId: z.string().trim().max(200).optional(),
   token: z.string().max(256).optional(),
   aesKey: z.string().max(43).optional(),
   secret: z.string().max(512).optional(),
@@ -308,18 +399,21 @@ app.post("/api/bots/save", auth, (req, res) => {
       !/^[a-zA-Z0-9]{3,32}$/.test(c.token) ||
       !/^[a-zA-Z0-9+/]{43}$/.test(c.aesKey || ""))
   )
-    return res
-      .status(400)
-      .json({
-        error:
-          "Token 需为 3–32 位字母或数字，EncodingAESKey 需为 43 位 Base64 字符",
-      });
+    return res.status(400).json({
+      error:
+        "Token 需为 3–32 位字母或数字，EncodingAESKey 需为 43 位 Base64 字符",
+    });
   if (v.mode === "websocket" && !c.secret)
     return res.status(400).json({ error: "请填写长连接 Secret" });
+  if (v.mode === "websocket" && !v.botId)
+    return res.status(400).json({ error: "请填写长连接 BotID" });
   const id = old?.id || randomUUID();
+  // Preserve existing URL records; new URL records use an internal identifier.
+  const botId =
+    v.mode === "url" ? (sameMode ? old.bot_id : `url:${id}`) : v.botId;
   db.prepare(
     "INSERT INTO bots (id,name,mode,bot_id,credentials,created_at) VALUES (?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name,mode=excluded.mode,bot_id=excluded.bot_id,credentials=excluded.credentials,verified_at=NULL",
-  ).run(id, v.name, v.mode, v.botId, seal(c, key), new Date().toISOString());
+  ).run(id, v.name, v.mode, botId, seal(c, key), new Date().toISOString());
   if (old) {
     db.prepare(
       "UPDATE messages SET expires_at=? WHERE bot_id=? AND status='pending'",
@@ -534,26 +628,64 @@ app.get("/api/audit", auth, (req, res) => {
   });
 });
 app.all("/callbacks/wecom", (req, res) => {
+  const context = { requestId: req.callbackId };
+  let stage = "lookup";
   try {
-    if (!["GET", "POST"].includes(req.method)) return res.sendStatus(405);
+    if (!["GET", "POST"].includes(req.method)) {
+      diagnostic("callback.rejected", {
+        ...context,
+        reason: "unsupported_method",
+      });
+      return res.sendStatus(405);
+    }
     const bot = findBot(String(req.query.bot || ""));
-    if (!bot || !bot.enabled || bot.mode !== "url") return res.sendStatus(404);
-    const plaintext = decryptCallback(
-      credentials(bot),
-      req.query,
-      req.method === "GET" ? req.query.echostr : req.body?.encrypt,
-    );
+    if (!bot || !bot.enabled || bot.mode !== "url") {
+      diagnostic("callback.rejected", {
+        ...context,
+        reason: !req.query.bot
+          ? "missing_bot_parameter"
+          : !bot
+            ? "bot_not_found"
+            : !bot.enabled
+              ? "bot_disabled"
+              : "wrong_mode",
+      });
+      return res.sendStatus(404);
+    }
+    context.botId = bot.id;
+    diagnostic("callback.bot_matched", context);
+    stage = "credentials";
+    const secret = credentials(bot);
+    stage = "decrypt";
+    const encrypted =
+      req.method === "GET" ? req.query.echostr : req.body?.encrypt;
+    diagnostic("callback.decrypt_started", {
+      ...context,
+      hasEncrypted: typeof encrypted === "string",
+      encryptedLength: typeof encrypted === "string" ? encrypted.length : 0,
+    });
+    const plaintext = decryptCallback(secret, req.query, encrypted);
+    diagnostic("callback.decrypted", {
+      ...context,
+      plaintextBytes: Buffer.byteLength(plaintext),
+    });
     if (req.method === "GET") {
+      stage = "verification_store";
       db.prepare("UPDATE bots SET verified_at=? WHERE id=?").run(
         new Date().toISOString(),
         bot.id,
       );
       log("回调 URL 验证成功", bot.name);
+      diagnostic("callback.verified", context);
       return res.type("text/plain").send(plaintext);
     }
-    receive(bot, JSON.parse(plaintext));
+    stage = "parse_message";
+    const body = JSON.parse(plaintext);
+    stage = "receive_message";
+    receive(bot, body, "", req.callbackId);
     res.status(200).end();
-  } catch {
+  } catch (error) {
+    diagnostic("callback.failed", { ...context, stage, ...safeError(error) });
     res.status(400).json({ error: "回调校验失败" });
   }
 });
@@ -563,6 +695,14 @@ if (existsSync(resolve("dist/index.html"))) {
   app.get("/{*path}", (_req, res) => res.sendFile(resolve("dist/index.html")));
 }
 app.use((err, _req, res, _next) => {
+  if (_req.callbackId)
+    diagnostic("callback.failed", {
+      requestId: _req.callbackId,
+      stage: "http_body",
+      bodyParseFailed: err.type === "entity.parse.failed",
+      bodyTooLarge: err.type === "entity.too.large",
+      ...safeError(err),
+    });
   if (err instanceof z.ZodError)
     return res
       .status(400)
@@ -590,6 +730,15 @@ const server = app.listen(
       .all())
       connections.start(bot);
     console.log(`企微桥服务已启动，端口 ${process.env.PORT || 3100}`);
+    diagnostic("service.ready", {
+      callbackPath: "/callbacks/wecom?bot=<internal-id>",
+      diagnostics: true,
+      enabledUrlBots: db
+        .prepare(
+          "SELECT count(*) AS n FROM bots WHERE enabled=1 AND mode='url'",
+        )
+        .get().n,
+    });
   },
 );
 function shutdown() {

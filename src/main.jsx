@@ -978,7 +978,9 @@ function Bots({ bots, create, edit, notify, refresh }) {
                 <Badge status={b.status} />
               </div>
               <h3>{b.name}</h3>
-              <p className="mono truncate">{b.bot_id}</p>
+              <p className="mono truncate">
+                {b.mode === "url" ? "URL 回调" : b.bot_id}
+              </p>
               <div className="bot-mode">
                 {b.mode === "url" ? <Webhook size={15} /> : <Zap size={15} />}{" "}
                 {b.mode === "url" ? "URL 回调模式" : "WebSocket 长连接"}
@@ -1142,15 +1144,17 @@ function BotDialog({ bot, close, saved, notify }) {
               </button>
             ))}
           </div>
-          <label>
-            BotID
-            <input
-              value={v.botId}
-              required
-              onChange={(e) => change("botId", e.target.value)}
-              placeholder="企业微信智能机器人的 BotID"
-            />
-          </label>
+          {v.mode === "websocket" && (
+            <label>
+              BotID
+              <input
+                value={v.botId}
+                required
+                onChange={(e) => change("botId", e.target.value)}
+                placeholder="企业微信智能机器人的 BotID"
+              />
+            </label>
+          )}
           {v.mode === "url" ? (
             <>
               <label>
@@ -1796,7 +1800,7 @@ function Deployment({ data, notify }) {
                 ],
                 [
                   "创建并启用机器人",
-                  "填写 BotID、Token、EncodingAESKey，保存后复制回调地址。",
+                  "填写 Token、EncodingAESKey，保存后复制完整回调地址。",
                 ],
                 [
                   "在企业微信验证回调",
