@@ -1,0 +1,25 @@
+services:
+  app:
+    build: .
+    init: true
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3100
+      DATA_DIR: /app/data
+      TZ: Asia/Shanghai
+    ports:
+      - "127.0.0.1:3100:3100"
+    volumes:
+      - bridge-data:/app/data
+    mem_limit: 512m
+    cpus: 1.5
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+volumes:
+  bridge-data:
