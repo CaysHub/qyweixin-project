@@ -105,15 +105,47 @@ TZ=Asia/Shanghai
 
 ### 方案 B：已有 PM2 时
 
+项目 `devDependencies` 自带 PM2，生产服务器建议再全局安装一份：
+
+```bash
+npm install -g pm2
+```
+
+启动、验证并设置开机自启：
+
 ```bash
 cd /www/wwwroot/wecom-bridge
 pm2 start deploy/ecosystem.config.cjs
+curl -fsS http://127.0.0.1:3100/api/health
 pm2 save
+pm2 startup systemd
 ```
 
-按照 `pm2 startup` 提示设置当前运行用户的开机启动。不要同时启用方案 A。
+按 `pm2 startup` 输出的提示执行对应的 sudo 命令，完成当前运行用户的开机启动设置。不要同时启用方案 A。
 
-更新发布使用 `pm2 restart wecom-bridge`，不要使用 cluster reload 或零停机双实例部署；长连接切换会短暂中断，随后重新订阅。生产日志需要配置轮转。
+配置要点（见 `deploy/ecosystem.config.cjs`）：单实例 fork 运行；使用 `--env-file-if-exists=.env`，文件缺失时应用会提示先运行 `npm run setup`，而不是报晦涩的 Node 启动错误；V8 堆上限 384MB，RSS 超 512MB 自动重启；启动后 30 秒内退出视为异常启动，连续 10 次后停止并告警，指数退避重试；SIGINT 优雅退出，15 秒超时兜底。`NODE_ENV` 未显式指定时按生产环境运行；本地试用开发配置可用 `NODE_ENV=development pm2 start deploy/ecosystem.config.cjs`。
+
+日常管理可直接使用 `package.json` 提供的脚本，与同名 pm2 命令等价：
+
+| 命令 | 作用 |
+| --- | --- |
+| `npm run pm2:status` | 查看进程状态、内存与重启次数 |
+| `npm run pm2:logs` | 查看最近 200 行日志，Ctrl+C 退出 |
+| `npm run pm2:restart` | 重启；修改 `.env` 或更新代码后执行 |
+| `npm run pm2:stop` | 优雅停止，长连接正常断开 |
+| `npm run pm2:start` | 按配置文件启动（首次或停止后） |
+| `npm run pm2:delete` | 从 PM2 列表移除，不影响 `.env` 与数据 |
+
+日志写入项目 `logs/wecom-bridge-out.log` 与 `logs/wecom-bridge-error.log`，带时间戳前缀；`pm2 logs wecom-bridge --lines 200` 读取同样内容。生产环境安装日志轮转，避免日志占满磁盘：
+
+```bash
+pm2 install pm2-logrotate
+pm2 set pm2-logrotate:max_size 10M
+pm2 set pm2-logrotate:retain 7
+pm2 set pm2-logrotate:compress true
+```
+
+更新发布使用 `pm2 restart wecom-bridge`，不要使用 cluster reload 或零停机双实例部署；长连接切换会短暂中断，随后重新订阅。
 
 ### 方案 C：可选 Docker Compose
 

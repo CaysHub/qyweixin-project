@@ -142,45 +142,42 @@ chmod 600 .env
 
 ### 单实例进程托管
 
-可以选择宝塔 Node 项目管理，或使用 PM2；不要同时启动两份应用。PM2 安装命令：
+可以选择宝塔 Node 项目管理，或使用 PM2；不要同时启动两份应用。项目 `devDependencies` 已包含 PM2，完整安装后本地即可使用；生产服务器建议全局安装：
 
 ```bash
 npm install -g pm2
 ```
 
-若已有 `npm start` 前台进程，先停止它，然后使用项目提供的单实例配置启动：
+若已有 `npm start` 前台进程，先停止它，然后使用项目提供的单实例配置启动。配置内容见 `deploy/ecosystem.config.cjs`：单实例 fork、`--env-file-if-exists=.env`、V8 堆上限 384MB、RSS 超 512MB 自动重启、30 秒内连续异常启动 10 次后停止、SIGINT 优雅退出、日志写入 `logs/` 目录。
 
 ```bash
-pm2 start deploy/ecosystem.config.cjs
+npm run pm2:start    # 等价于 pm2 start deploy/ecosystem.config.cjs
 ```
 
-保存进程列表：
+保存进程列表并配置开机自启，按 PM2 输出完成对应运行用户的服务设置：
 
 ```bash
 pm2 save
-```
-
-配置开机自启，并按 PM2 输出完成对应运行用户的服务设置：
-
-```bash
 pm2 startup systemd
 ```
 
-检查状态：
+检查状态与验证应用：
 
 ```bash
-pm2 status
-```
-
-验证应用：
-
-```bash
+npm run pm2:status
 curl -fsS http://127.0.0.1:3100/api/health
 ```
 
-正常返回 `{"ok":true}`。修改 `.env` 后使用 `pm2 restart wecom-bridge` 重启。不要使用 PM2 cluster 或多个副本；每个机器人同一时间只允许一条有效长连接。
+正常返回 `{"ok":true}`。修改 `.env` 或更新代码后使用 `npm run pm2:restart` 重启；`npm run pm2:logs` 查看日志，`npm run pm2:stop` 优雅停止，`npm run pm2:delete` 移出 PM2 管理（不影响配置和数据）。不要使用 PM2 cluster 或多个副本；每个机器人同一时间只允许一条有效长连接。
 
-建议安装 `pm2-logrotate`，设置日志阈值 10MB、保留 7 个历史文件并开启压缩，避免日志占满磁盘。
+建议安装 `pm2-logrotate`，设置日志阈值 10MB、保留 7 个历史文件并开启压缩，避免日志占满磁盘：
+
+```bash
+pm2 install pm2-logrotate
+pm2 set pm2-logrotate:max_size 10M
+pm2 set pm2-logrotate:retain 7
+pm2 set pm2-logrotate:compress true
+```
 
 ### Nginx、HTTPS 与临时 IP 访问
 
