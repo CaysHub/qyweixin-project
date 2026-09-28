@@ -388,6 +388,14 @@ function Landing() {
         <Brand />
         <span>连接消息，连接工作。© {new Date().getFullYear()} 企微桥</span>
         <span>独立接入工具 · 非企业微信官方产品</span>
+        <a
+          className="icp"
+          href="https://beian.miit.gov.cn/"
+          target="_blank"
+          rel="noreferrer"
+        >
+          浙ICP备2026013650号-2
+        </a>
       </footer>
     </div>
   );
